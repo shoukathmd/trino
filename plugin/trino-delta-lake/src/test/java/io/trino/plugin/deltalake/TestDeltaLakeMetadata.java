@@ -284,7 +284,7 @@ public class TestDeltaLakeMetadata
                         ImmutableList.of(BIGINT_COLUMN_1, BIGINT_COLUMN_2),
                         ImmutableList.of(BIGINT_COLUMN_2, MISSING_COLUMN))))
                 .isInstanceOf(TrinoException.class)
-                .hasMessage("Table property 'partition_by' contained column names which do not exist: [missing_column]");
+                .hasMessage("Table property 'partitioned_by' contained column names which do not exist: [missing_column]");
 
         assertThatThrownBy(() -> deltaLakeMetadata.getNewTableLayout(
                 SESSION,
@@ -475,7 +475,7 @@ public class TestDeltaLakeMetadata
                 ImmutableList.of(BIGINT_COLUMN_1));
         deltaLakeMetadata.createTable(SESSION, tableMetadata, false);
         DeltaLakeTableHandle tableHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(SESSION, tableMetadata.getTable());
-        assertThat(deltaLakeMetadata.getInfo(tableHandle)).isEqualTo(Optional.of(new DeltaLakeInputInfo(true)));
+        assertThat(deltaLakeMetadata.getInfo(tableHandle)).isEqualTo(Optional.of(new DeltaLakeInputInfo(true, 0)));
         deltaLakeMetadata.cleanupQuery(SESSION);
     }
 
@@ -488,7 +488,7 @@ public class TestDeltaLakeMetadata
                 ImmutableList.of());
         deltaLakeMetadata.createTable(SESSION, tableMetadata, false);
         DeltaLakeTableHandle tableHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(SESSION, tableMetadata.getTable());
-        assertThat(deltaLakeMetadata.getInfo(tableHandle)).isEqualTo(Optional.of(new DeltaLakeInputInfo(false)));
+        assertThat(deltaLakeMetadata.getInfo(tableHandle)).isEqualTo(Optional.of(new DeltaLakeInputInfo(false, 0)));
         deltaLakeMetadata.cleanupQuery(SESSION);
     }
 

@@ -37,8 +37,12 @@ import com.google.errorprone.annotations.concurrent.GuardedBy;
 import io.airlift.log.Logger;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
 import io.trino.Session;
+import io.trino.exchange.ExchangeContextInstance;
 import io.trino.exchange.SpoolingExchangeInput;
 import io.trino.execution.BasicStageStats;
 import io.trino.execution.ExecutionFailureInfo;
@@ -100,6 +104,7 @@ import io.trino.sql.planner.plan.PlanFragmentId;
 import io.trino.sql.planner.plan.PlanNode;
 import io.trino.sql.planner.plan.PlanNodeId;
 import io.trino.sql.planner.plan.RemoteSourceNode;
+import io.trino.tracing.TrinoAttributes;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
@@ -179,6 +184,7 @@ import static io.trino.sql.planner.SystemPartitioningHandle.COORDINATOR_DISTRIBU
 import static io.trino.sql.planner.SystemPartitioningHandle.SINGLE_DISTRIBUTION;
 import static io.trino.sql.planner.TopologicalOrderSubPlanVisitor.sortPlanInTopologicalOrder;
 import static io.trino.sql.planner.plan.ExchangeNode.Type.REPLICATE;
+import static io.trino.tracing.TrinoAttributes.FAILURE_MESSAGE;
 import static io.trino.util.Failures.toFailure;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
@@ -651,9 +657,11 @@ public class EventDrivenFaultTolerantQueryScheduler
         private static final int EVENT_BUFFER_CAPACITY = 100;
         private static final long EVENT_PROCESSING_ENFORCED_FREQUENCY_MILLIS = MINUTES.toMillis(1);
         // If scheduler is stalled for SCHEDULER_STALLED_DURATION_THRESHOLD debug log will be emitted.
-        // This value must be larger than EVENT_PROCESSING_ENFORCED_FREQUENCY as prerequiste for processing is
+        // If situation persists event logs will be emitted at SCHEDULER_MAX_DEBUG_INFO_FREQUENCY.
+        // SCHEDULER_STALLED_DURATION_THRESHOLD must be larger than EVENT_PROCESSING_ENFORCED_FREQUENCY as prerequiste for processing is
         // that there are no events in the event queue.
-        private static final long SCHEDULER_STALLED_DURATION_THRESHOLD_MILLIS = MINUTES.toMillis(5);
+        private static final long SCHEDULER_STALLED_DURATION_THRESHOLD_MILLIS = MINUTES.toMillis(10);
+        private static final long SCHEDULER_MAX_DEBUG_INFO_FREQUENCY_MILLIS = MINUTES.toMillis(10);
         private static final long SCHEDULER_STALLED_DURATION_ON_TIME_EXCEEDED_THRESHOLD_MILLIS = SECONDS.toMillis(30);
         private static final int EVENTS_DEBUG_INFOS_PER_BUCKET = 10;
 
@@ -667,6 +675,7 @@ public class EventDrivenFaultTolerantQueryScheduler
         private final ExecutorService queryExecutor;
         private final ScheduledExecutorService scheduledExecutorService;
         private final Tracer tracer;
+        private final Span schedulerSpan;
         private final SplitSchedulerStats schedulerStats;
         private final PartitionMemoryEstimatorFactory memoryEstimatorFactory;
         private final OutputDataSizeEstimator outputDataSizeEstimator;
@@ -688,7 +697,8 @@ public class EventDrivenFaultTolerantQueryScheduler
 
         private final BlockingQueue<Event> eventQueue = new LinkedBlockingQueue<>();
         private final List<Event> eventBuffer = new ArrayList<>(EVENT_BUFFER_CAPACITY);
-        private final Stopwatch eventDebugInfoStopwatch = Stopwatch.createUnstarted();
+        private final Stopwatch noEventsStopwatch = Stopwatch.createUnstarted();
+        private final Stopwatch debugInfoStopwatch = Stopwatch.createUnstarted();
         private final Optional<EventDebugInfos> eventDebugInfos;
 
         private boolean started;
@@ -772,6 +782,10 @@ public class EventDrivenFaultTolerantQueryScheduler
             this.runtimeAdaptivePartitioningPartitionCount = runtimeAdaptivePartitioningPartitionCount;
             this.runtimeAdaptivePartitioningMaxTaskSizeInBytes = requireNonNull(runtimeAdaptivePartitioningMaxTaskSize, "runtimeAdaptivePartitioningMaxTaskSize is null").toBytes();
             this.stageEstimationForEagerParentEnabled = stageEstimationForEagerParentEnabled;
+            this.schedulerSpan = tracer.spanBuilder("scheduler")
+                .setParent(Context.current().with(queryStateMachine.getSession().getQuerySpan()))
+                .setAttribute(TrinoAttributes.QUERY_ID, queryStateMachine.getQueryId().toString())
+                .startSpan();
 
             if (log.isDebugEnabled()) {
                 eventDebugInfos = Optional.of(new EventDebugInfos(queryStateMachine.getQueryId().toString(), EVENTS_DEBUG_INFOS_PER_BUCKET));
@@ -781,7 +795,7 @@ public class EventDrivenFaultTolerantQueryScheduler
             }
 
             planInTopologicalOrder = sortPlanInTopologicalOrder(plan);
-            eventDebugInfoStopwatch.start();
+            noEventsStopwatch.start();
         }
 
         public void run()
@@ -801,8 +815,8 @@ public class EventDrivenFaultTolerantQueryScheduler
                 }
                 if (queryInfo.getState() == QueryState.FAILED
                         && queryInfo.getErrorCode() == EXCEEDED_TIME_LIMIT.toErrorCode()
-                        && eventDebugInfoStopwatch.elapsed().toMillis() > SCHEDULER_STALLED_DURATION_ON_TIME_EXCEEDED_THRESHOLD_MILLIS) {
-                    logDebugInfoSafe(format("Scheduler stalled for %s on EXCEEDED_TIME_LIMIT", eventDebugInfoStopwatch.elapsed()));
+                        && noEventsStopwatch.elapsed().toMillis() > SCHEDULER_STALLED_DURATION_ON_TIME_EXCEEDED_THRESHOLD_MILLIS) {
+                    logDebugInfoSafe(format("Scheduler stalled for %s on EXCEEDED_TIME_LIMIT", noEventsStopwatch.elapsed()));
                 }
             });
 
@@ -834,7 +848,11 @@ public class EventDrivenFaultTolerantQueryScheduler
             preSchedulingTaskContexts.clear();
             failure = closeAndAddSuppressed(failure, nodeAllocator);
 
-            failure.ifPresent(queryStateMachine::transitionToFailed);
+            failure.ifPresent(fail -> {
+                queryStateMachine.transitionToFailed(fail);
+                schedulerSpan.addEvent("scheduler_failure", Attributes.of(FAILURE_MESSAGE, fail.getMessage()));
+            });
+            schedulerSpan.end();
         }
 
         private Optional<Throwable> closeAndAddSuppressed(Optional<Throwable> existingFailure, Closeable closeable)
@@ -896,13 +914,16 @@ public class EventDrivenFaultTolerantQueryScheduler
             if (eventDebugInfoRecorded) {
                 // mark that we processed some events; we filter out some no-op events.
                 // If only no-op events appear in event queue we still treat scheduler as stuck
-                eventDebugInfoStopwatch.reset().start();
+                noEventsStopwatch.reset().start();
+                debugInfoStopwatch.reset();
             }
             else {
                 // if no events were recorded there is a chance scheduler is stalled
-                if (log.isDebugEnabled() && eventDebugInfoStopwatch.elapsed().toMillis() > SCHEDULER_STALLED_DURATION_THRESHOLD_MILLIS) {
-                    logDebugInfoSafe("Scheduler stalled for %s".formatted(eventDebugInfoStopwatch.elapsed()));
-                    eventDebugInfoStopwatch.reset().start(); // reset to prevent extensive logging
+                if (log.isDebugEnabled()
+                        && (!debugInfoStopwatch.isRunning() || debugInfoStopwatch.elapsed().toMillis() > SCHEDULER_MAX_DEBUG_INFO_FREQUENCY_MILLIS)
+                        && noEventsStopwatch.elapsed().toMillis() > SCHEDULER_STALLED_DURATION_THRESHOLD_MILLIS) {
+                    logDebugInfoSafe("Scheduler stalled for %s".formatted(noEventsStopwatch.elapsed()));
+                    debugInfoStopwatch.reset().start(); // reset to prevent extensive logging
                 }
             }
 
@@ -1372,6 +1393,7 @@ public class EventDrivenFaultTolerantQueryScheduler
                         nodeTaskMap,
                         queryStateMachine.getStateMachineExecutor(),
                         tracer,
+                        schedulerSpan,
                         schedulerStats);
                 closer.register(stage::abort);
                 stageRegistry.add(stage);
@@ -1415,7 +1437,10 @@ public class EventDrivenFaultTolerantQueryScheduler
                 FaultTolerantPartitioningScheme sinkPartitioningScheme = partitioningSchemeFactory.get(
                         fragment.getOutputPartitioningScheme().getPartitioning().getHandle(),
                         fragment.getOutputPartitioningScheme().getPartitionCount());
-                ExchangeContext exchangeContext = new ExchangeContext(queryStateMachine.getQueryId(), new ExchangeId("external-exchange-" + stage.getStageId().getId()));
+                ExchangeContext exchangeContext = new ExchangeContextInstance(
+                        queryStateMachine.getQueryId(),
+                        new ExchangeId("external-exchange-" + stage.getStageId().getId()),
+                        schedulerSpan);
 
                 boolean preserveOrderWithinPartition = rootFragment && stage.getFragment().getPartitioning().equals(SINGLE_DISTRIBUTION);
                 Exchange exchange = closer.register(exchangeManager.createExchange(

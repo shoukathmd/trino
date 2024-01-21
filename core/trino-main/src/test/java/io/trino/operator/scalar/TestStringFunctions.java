@@ -2096,6 +2096,17 @@ public class TestStringFunctions
 
         assertTrinoExceptionThrownBy(assertions.function("lpad", "'abc'", Long.toString(maxSize + 1), "''")::evaluate)
                 .hasMessage("Target length must be in the range [0.." + maxSize + "]");
+
+        assertThat(assertions.function("lpad", "CHAR 'abc   '", "6", "'def'"))
+                .matches("VARCHAR 'abc   '");
+        assertThat(assertions.function("lpad", "CHAR 'abc   '", "4", "'def'"))
+                .matches("VARCHAR 'abc '");
+        assertThat(assertions.function("lpad", "CHAR 'abc   '", "8", "'def'"))
+                .matches("VARCHAR 'deabc   '");
+        assertThat(assertions.function("lpad", "CHAR 'abc   '", "10", "'def'"))
+                .matches("VARCHAR 'defdabc   '");
+        assertThat(assertions.function("lpad", "CAST('abc' AS char(6))", "10", "'def'"))
+                .matches("VARCHAR 'defdabc   '");
     }
 
     @Test
@@ -2240,6 +2251,10 @@ public class TestStringFunctions
                 .hasType(VARCHAR)
                 .isEqualTo("hello");
 
+        assertThat(assertions.function("from_utf8", "to_utf8(cast('hello' as char(10)))"))
+                .hasType(VARCHAR)
+                .isEqualTo("hello     ");
+
         assertThat(assertions.function("from_utf8", "from_hex('58BF')"))
                 .hasType(VARCHAR)
                 .isEqualTo("X\uFFFD");
@@ -2268,6 +2283,12 @@ public class TestStringFunctions
                 .hasErrorCode(INVALID_FUNCTION_ARGUMENT);
 
         assertTrinoExceptionThrownBy(assertions.function("from_utf8", "to_utf8('hello')", "1114112")::evaluate)
+                .hasErrorCode(INVALID_FUNCTION_ARGUMENT);
+
+        assertTrinoExceptionThrownBy(assertions.function("from_utf8", "to_utf8(cast('hello' as char(10)))", "'foo'")::evaluate)
+                .hasErrorCode(INVALID_FUNCTION_ARGUMENT);
+
+        assertTrinoExceptionThrownBy(assertions.function("from_utf8", "to_utf8(cast('hello' as char(10)))", "1114112")::evaluate)
                 .hasErrorCode(INVALID_FUNCTION_ARGUMENT);
     }
 

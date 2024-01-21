@@ -227,6 +227,7 @@ import static io.trino.plugin.iceberg.IcebergSessionProperties.isProjectionPushd
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isQueryPartitionFilterRequired;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isStatisticsEnabled;
 import static io.trino.plugin.iceberg.IcebergTableName.isDataTable;
+import static io.trino.plugin.iceberg.IcebergTableName.isIcebergTableName;
 import static io.trino.plugin.iceberg.IcebergTableName.isMaterializedViewStorage;
 import static io.trino.plugin.iceberg.IcebergTableName.tableNameFrom;
 import static io.trino.plugin.iceberg.IcebergTableProperties.FILE_FORMAT_PROPERTY;
@@ -259,6 +260,7 @@ import static io.trino.plugin.iceberg.TableStatisticsWriter.StatsUpdateMode.REPL
 import static io.trino.plugin.iceberg.TableType.DATA;
 import static io.trino.plugin.iceberg.TypeConverter.toIcebergTypeForNewColumn;
 import static io.trino.plugin.iceberg.catalog.hms.TrinoHiveCatalog.DEPENDS_ON_TABLES;
+import static io.trino.plugin.iceberg.catalog.hms.TrinoHiveCatalog.DEPENDS_ON_TABLE_FUNCTIONS;
 import static io.trino.plugin.iceberg.catalog.hms.TrinoHiveCatalog.TRINO_QUERY_START_TIME;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.DROP_EXTENDED_STATS;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.EXPIRE_SNAPSHOTS;
@@ -388,6 +390,10 @@ public class IcebergMetadata
     {
         if (startVersion.isPresent()) {
             throw new TrinoException(NOT_SUPPORTED, "Read table with start version is not supported");
+        }
+
+        if (!isIcebergTableName(tableName.getTableName())) {
+            return null;
         }
 
         if (isMaterializedViewStorage(tableName.getTableName())) {
@@ -550,7 +556,7 @@ public class IcebergMetadata
 
     private Optional<SystemTable> getRawSystemTable(ConnectorSession session, SchemaTableName tableName)
     {
-        if (isDataTable(tableName.getTableName()) || isMaterializedViewStorage(tableName.getTableName())) {
+        if (!isIcebergTableName(tableName.getTableName()) || isDataTable(tableName.getTableName()) || isMaterializedViewStorage(tableName.getTableName())) {
             return Optional.empty();
         }
 
@@ -568,21 +574,16 @@ public class IcebergMetadata
             return Optional.empty();
         }
 
-        Optional<TableType> tableType = IcebergTableName.tableTypeFrom(tableName.getTableName());
-        if (tableType.isEmpty()) {
-            return Optional.empty();
-        }
-        SchemaTableName systemTableName = new SchemaTableName(tableName.getSchemaName(), IcebergTableName.tableNameWithType(name, tableType.get()));
-        return switch (tableType.get()) {
-            case DATA -> throw new VerifyException("Unexpected DATA table type"); // Handled above.
-            case HISTORY -> Optional.of(new HistoryTable(systemTableName, table));
-            case SNAPSHOTS -> Optional.of(new SnapshotsTable(systemTableName, typeManager, table));
-            case PARTITIONS -> Optional.of(new PartitionTable(systemTableName, typeManager, table, getCurrentSnapshotId(table)));
-            case MANIFESTS -> Optional.of(new ManifestsTable(systemTableName, table, getCurrentSnapshotId(table)));
-            case FILES -> Optional.of(new FilesTable(systemTableName, typeManager, table, getCurrentSnapshotId(table)));
-            case PROPERTIES -> Optional.of(new PropertiesTable(systemTableName, table));
-            case REFS -> Optional.of(new RefsTable(systemTableName, table));
-            case MATERIALIZED_VIEW_STORAGE -> throw new VerifyException("Unexpected MATERIALIZED_VIEW_STORAGE table type");
+        TableType tableType = IcebergTableName.tableTypeFrom(tableName.getTableName());
+        return switch (tableType) {
+            case DATA, MATERIALIZED_VIEW_STORAGE -> throw new VerifyException("Unexpected table type: " + tableType); // Handled above.
+            case HISTORY -> Optional.of(new HistoryTable(tableName, table));
+            case SNAPSHOTS -> Optional.of(new SnapshotsTable(tableName, typeManager, table));
+            case PARTITIONS -> Optional.of(new PartitionTable(tableName, typeManager, table, getCurrentSnapshotId(table)));
+            case MANIFESTS -> Optional.of(new ManifestsTable(tableName, table, getCurrentSnapshotId(table)));
+            case FILES -> Optional.of(new FilesTable(tableName, typeManager, table, getCurrentSnapshotId(table)));
+            case PROPERTIES -> Optional.of(new PropertiesTable(tableName, table));
+            case REFS -> Optional.of(new RefsTable(tableName, table));
         };
     }
 
@@ -2804,7 +2805,8 @@ public class IcebergMetadata
             ConnectorInsertTableHandle insertHandle,
             Collection<Slice> fragments,
             Collection<ComputedStatistics> computedStatistics,
-            List<ConnectorTableHandle> sourceTableHandles)
+            List<ConnectorTableHandle> sourceTableHandles,
+            List<String> sourceTableFunctions)
     {
         IcebergWritableTableHandle table = (IcebergWritableTableHandle) insertHandle;
 
@@ -2842,7 +2844,7 @@ public class IcebergMetadata
             writtenFiles.add(task.getPath());
         }
 
-        String dependencies = sourceTableHandles.stream()
+        String tableDependencies = sourceTableHandles.stream()
                 .map(handle -> {
                     if (!(handle instanceof IcebergTableHandle icebergHandle)) {
                         return UNKNOWN_SNAPSHOT_TOKEN;
@@ -2863,7 +2865,8 @@ public class IcebergMetadata
         }
 
         // Update the 'dependsOnTables' property that tracks tables on which the materialized view depends and the corresponding snapshot ids of the tables
-        appendFiles.set(DEPENDS_ON_TABLES, dependencies);
+        appendFiles.set(DEPENDS_ON_TABLES, tableDependencies);
+        appendFiles.set(DEPENDS_ON_TABLE_FUNCTIONS, Boolean.toString(!sourceTableFunctions.isEmpty()));
         appendFiles.set(TRINO_QUERY_START_TIME, session.getStart().toString());
         commit(appendFiles, session);
 
@@ -2932,17 +2935,29 @@ public class IcebergMetadata
                 .orElseThrow(() -> new IllegalStateException("Storage table missing in definition of materialized view " + materializedViewName));
 
         Table icebergTable = catalog.loadTable(session, storageTableName);
-        String dependsOnTables = Optional.ofNullable(icebergTable.currentSnapshot())
+        Optional<Snapshot> currentSnapshot = Optional.ofNullable(icebergTable.currentSnapshot());
+        String dependsOnTables = currentSnapshot
                 .map(snapshot -> snapshot.summary().getOrDefault(DEPENDS_ON_TABLES, ""))
                 .orElse("");
+        boolean dependsOnTableFunctions = currentSnapshot
+                .map(snapshot -> Boolean.valueOf(snapshot.summary().getOrDefault(DEPENDS_ON_TABLE_FUNCTIONS, "false")))
+                .orElse(false);
+
+        Optional<Instant> refreshTime = currentSnapshot.map(snapshot -> snapshot.summary().get(TRINO_QUERY_START_TIME))
+                .map(Instant::parse)
+                .or(() -> currentSnapshot.map(snapshot -> Instant.ofEpochMilli(snapshot.timestampMillis())));
+
+        if (dependsOnTableFunctions) {
+            // It can't be determined whether a value returned by table function is STALE or not
+            return new MaterializedViewFreshness(UNKNOWN, refreshTime);
+        }
+
         if (dependsOnTables.isEmpty()) {
             // Information missing. While it's "unknown" whether storage is stale, we return "stale".
             // Normally dependsOnTables may be missing only when there was no refresh yet.
             return new MaterializedViewFreshness(STALE, Optional.empty());
         }
-        Instant refreshTime = Optional.ofNullable(icebergTable.currentSnapshot().summary().get(TRINO_QUERY_START_TIME))
-                .map(Instant::parse)
-                .orElseGet(() -> Instant.ofEpochMilli(icebergTable.currentSnapshot().timestampMillis()));
+
         boolean hasUnknownTables = false;
         boolean hasStaleIcebergTables = false;
         Optional<Long> firstTableChange = Optional.of(Long.MAX_VALUE);
@@ -2984,32 +2999,30 @@ public class IcebergMetadata
             else {
                 snapshotAtRefresh = Optional.of(Long.parseLong(value));
             }
-            TableChangeInfo tableChangeInfo = getTableChangeInfo(session, (IcebergTableHandle) tableHandle, snapshotAtRefresh);
-            if (tableChangeInfo instanceof NoTableChange) {
-                // Fresh
-            }
-            else if (tableChangeInfo instanceof FirstChangeSnapshot firstChange) {
-                hasStaleIcebergTables = true;
-                firstTableChange = firstTableChange
-                        .map(epochMilli -> Math.min(epochMilli, firstChange.snapshot().timestampMillis()));
-            }
-            else if (tableChangeInfo instanceof UnknownTableChange) {
-                hasStaleIcebergTables = true;
-                firstTableChange = Optional.empty();
-            }
-            else {
-                throw new IllegalStateException("Unhandled table change info " + tableChangeInfo);
+            switch (getTableChangeInfo(session, (IcebergTableHandle) tableHandle, snapshotAtRefresh)) {
+                case NoTableChange() -> {
+                    // Fresh
+                }
+                case FirstChangeSnapshot(Snapshot snapshot) -> {
+                    hasStaleIcebergTables = true;
+                    firstTableChange = firstTableChange
+                            .map(epochMilli -> Math.min(epochMilli, snapshot.timestampMillis()));
+                }
+                case UnknownTableChange() -> {
+                    hasStaleIcebergTables = true;
+                    firstTableChange = Optional.empty();
+                }
             }
         }
 
-        Instant lastFreshTime = firstTableChange
+        Optional<Instant> lastFreshTime = firstTableChange
                 .map(Instant::ofEpochMilli)
-                .orElse(refreshTime);
+                .or(() -> refreshTime);
         if (hasStaleIcebergTables) {
-            return new MaterializedViewFreshness(STALE, Optional.of(lastFreshTime));
+            return new MaterializedViewFreshness(STALE, lastFreshTime);
         }
         if (hasUnknownTables) {
-            return new MaterializedViewFreshness(UNKNOWN, Optional.of(lastFreshTime));
+            return new MaterializedViewFreshness(UNKNOWN, lastFreshTime);
         }
         return new MaterializedViewFreshness(FRESH, Optional.empty());
     }
@@ -3111,7 +3124,7 @@ public class IcebergMetadata
     private sealed interface TableChangeInfo
             permits NoTableChange, FirstChangeSnapshot, UnknownTableChange {}
 
-    private static final class NoTableChange
+    private record NoTableChange()
             implements TableChangeInfo {}
 
     private record FirstChangeSnapshot(Snapshot snapshot)
@@ -3123,6 +3136,6 @@ public class IcebergMetadata
         }
     }
 
-    private static final class UnknownTableChange
+    private record UnknownTableChange()
             implements TableChangeInfo {}
 }
