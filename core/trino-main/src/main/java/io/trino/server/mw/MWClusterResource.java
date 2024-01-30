@@ -24,7 +24,7 @@ import jakarta.ws.rs.Produces;
 
 import static io.trino.server.security.ResourceSecurity.AccessType.PUBLIC;
 
-@Path("/ui/api/mwcluster")
+@Path("/ui/api/trino-cluster-resource")
 public class MWClusterResource
 {
     private final NodeVersion version;
